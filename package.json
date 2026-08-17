@@ -1,0 +1,46 @@
+{
+  "name": "dsh-dog",
+  "version": "1.0.0",
+  "description": "Startup watchdog + auto-rollback for DeepSeek Harness (dsh). If `dsh web` fails to boot after installing a plugin, dsh-dog disables the offending plugin (keeps it downloaded) and retries — so a bad plugin never bricks your profile. Installs the `dsh-dog` command and adds it to your PATH.",
+  "type": "module",
+  "license": "MIT",
+  "author": {
+    "name": "yanwei999999",
+    "email": "yanwei999999@163.com"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yanwei999999/dsh-dog.git"
+  },
+  "homepage": "https://github.com/yanwei999999/dsh-dog",
+  "bugs": {
+    "url": "https://github.com/yanwei999999/dsh-dog/issues"
+  },
+  "bin": {
+    "dsh-dog": "./dsh-dog.mjs"
+  },
+  "files": [
+    "dsh-dog.mjs",
+    "dsh-dog.cmd",
+    "install.ps1",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "cordis",
+    "deepseek",
+    "plugin",
+    "watchdog",
+    "rollback",
+    "cli",
+    "dog"
+  ],
+  "dependencies": {
+    "js-yaml": "^4.2.0"
+  }
+}
