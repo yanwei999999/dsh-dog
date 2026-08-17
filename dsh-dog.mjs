@@ -7,6 +7,13 @@
  * 检测到失败，就自动「禁用」导致问题的插件（**保留已下载的文件和依赖，不删除**）
  * 并重试。
  *
+ * 如何定位「导致问题的插件」：
+ *   - 优先读取 dsh 启动报错的 stderr，从错误文本里解析出真正报错的插件
+ *     （如 `Cannot find package 'dsh-vault' …` → dsh-vault），据此精准禁用;
+ *   - 若错误文本解析不到，则回退为「相对上次快照新增/变更的第三方插件」猜测;
+ *   - 支持多次重试：一次禁不掉就一直根据下一次错误继续定位（二次、三次…）。
+ *   两种手段都只会「禁用」，不会删除已下载的插件。
+ *
  * 为什么是外部工具而不是 dsh 插件：坏插件会在插件树加载/启动阶段就让 dsh 崩溃，
  * 此时任何插件自身都还没机会运行，所以看门狗必须待在 dsh 进程之外。
  *
@@ -23,6 +30,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { spawn, spawnSync } from "node:child_process";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import yaml from "js-yaml";
 
 // ---------------------------------------------------------------------------
@@ -52,7 +60,7 @@ const SUCCESS_URL = /dsh (web|tui|headless)?:?\s+https?:\/\//i;
 
 const DSH_HOME_ENV = "DSH_HOME";
 const DEFAULT_GRACE_MS = 20000;
-const DEFAULT_RETRY = 1;
+const DEFAULT_RETRY = 2;
 
 /** 内置核心 bundle 前缀：这些是 dsh 安装自带的，永不参与「禁用」。 */
 const INBOX_PREFIX = "@deepseek-ai/";
@@ -172,6 +180,125 @@ function computeOffenders(currentManifest, goodManifest) {
   return [...out];
 }
 
+/**
+ * 从 dsh 启动错误的 stderr 文本里，尽力解析出「真正报错」的插件/包名。
+ *
+ * 为什么要解析错误：仅靠「相对快照新增/变更的第三方插件」（computeOffenders）去猜测
+ * 元凶，会把真正的错怪到新装插件头上。例如某个 link 依赖坏了，报错是
+ *   Cannot find package 'dsh-vault' imported from C:\...
+ *   failed to import loader entry dsh-vault (dsh-vault): ...
+ * 此时元凶其实是 dsh-vault（它没被算成「新增插件」），必须靠错误文本才能定位。
+ *
+ * 解析策略（按优先级取第一个命中）：
+ *   1. `Cannot find package '<pkg>'` → 取 <pkg>
+ *   2. `failed to import loader entry <id> (<pkg>)` 或 `loader entry <id> (…)` → 取 <id>
+ *   3. `failed to import loader entry <id>`、`cannot load plugin <id>` 等 → 取 <id>
+ *   4. 兜底：`imported from C:\…\profiles\<profile>\node_modules\<pkg>` → 取 pkg
+ * 结果会过滤掉 node: 内置、路径片段、@deepseek-ai/* 核心包，并做基本去重。
+ *
+ * @param {string} stderr dsh 启动收集到的 stderr 全文
+ * @param {string} profile 当前 profile 名
+ * @returns {string[]} 候选出错插件名（未命中则空数组）
+ */
+function parsePluginFromStderr(stderr, profile = "") {
+  if (!stderr) return [];
+  const text = stderr.replace(/\0/g, "");
+  const seen = new Set();
+  const isPlausible = (name) => {
+    if (!name || typeof name !== "string") return false;
+    const n = name.trim();
+    if (n.length === 0) return false;
+    if (/^node:/i.test(n)) return false; // node:fs 等内置模块
+    if (/[\\]/.test(n)) return false; // 反斜杠路径
+    if (n.startsWith("@")) {
+      // @scope/name 允许，但必须恰好两段，且段不含奇怪字符
+      if (!/^@[^/]+\/[^/]+$/.test(n)) return false;
+    } else {
+      // 非 scoped：必须是单个短名（dsh-vault 风格），不允许斜杠
+      if (n.includes("/")) return false;
+    }
+    if (/\.(js|mjs|cjs|json|ts)$/i.test(n)) return false; // 文件名
+    if (/\.(ds?)$/i.test(n)) return false; // 盘符尾
+    return true;
+  };
+  const push = (name) => {
+    if (!name) return;
+    const clean = String(name).trim();
+    if (clean.startsWith(INBOX_PREFIX)) return;
+    if (isPlausible(clean) && !seen.has(clean)) seen.add(clean);
+  };
+
+  // 1) Cannot find package '<pkg>'  — 最常见的 ESM 解析失败信号
+  const re1 = /Cannot find package '([^']+)'/g;
+  let m;
+  while ((m = re1.exec(text))) push(m[1]);
+
+  // 2) failed to import loader entry <id> (<pkg>)  或  loader entry <id> (…)
+  const re2 = /(?:failed to )?import loader entry ([A-Za-z0-9@._-]+)\s*(?:\(([^)]+)\))?/gi;
+  while ((m = re2.exec(text))) {
+    push(m[1]);
+    if (m[2]) push(m[2]);
+  }
+
+  // 3a) `X did not activate` → X 是插件入口名（常见于插件在激活阶段抛错）
+  const re3a = /([A-Za-z0-9@._-]+)\s+did not activate/gi;
+  while ((m = re3a.exec(text))) push(m[1]);
+
+  // 3b) 明确的插件加载失败动词
+  const re3b = /(?:cannot load plugin|could not load plugin|failed to load plugin)\s+'?([A-Za-z0-9@._-]+)/gi;
+  while ((m = re3b.exec(text))) push(m[1]);
+
+  // 4) 兜底：imported from …\node_modules\<pkg>  (最后一段才是包名)
+  const re4 = /imported from\s+(?:"|')?([^\s"']+)[^"']*(?:"|')?/gi;
+  while ((m = re4.exec(text))) {
+    const p = m[1];
+    const idx = p.toLowerCase().indexOf("node_modules");
+    if (idx >= 0) {
+      let rest = p.slice(idx + "node_modules".length).replace(/\\/g, "/").replace(/^\//, "");
+      // 可能带 @scope/name 或 name/子路径
+      const parts = rest.split("/");
+      if (parts[0]?.startsWith("@") && parts.length >= 2) push(`${parts[0]}/${parts[1]}`);
+      else if (parts[0]) push(parts[0]);
+    }
+  }
+
+  return [...seen];
+}
+
+/**
+ * 决策「要禁用哪些插件」的纯函数（便于单测）。
+ *
+ * 优先级：先从启动错误 stderr 定位真正报错的插件；**只要错误定位到了插件，
+ * 就以它为准（只禁报错者）**，不会连坐无辜的新装插件。仅当错误里解析不到
+ * 任何插件名时，才回退到「相对快照新增/变更」的配置猜测。
+ *
+ * @param {object} currentManifest 当前 package.json
+ * @param {object} goodManifest   快照 package.json
+ * @param {string} stderr         dsh 启动错误文本（可为空）
+ * @param {string} profile        profile 名
+ * @returns {{combined:string[], fromError:string[]}} 合并后候选 + 哪些来自错误解析
+ */
+function pickDisableCandidates(currentManifest, goodManifest, stderr, profile = "") {
+  const errorPlugins = parsePluginFromStderr(stderr, profile);
+  const fromError = errorPlugins.filter((n) => n && n !== profile);
+  if (fromError.length > 0) {
+    return { combined: fromError, fromError };
+  }
+  const offenders = computeOffenders(currentManifest, goodManifest);
+  return { combined: offenders, fromError };
+}
+
+/**
+ * 收集 profile 里「所有第三方」bundle 名（排除 @deepseek-ai/* 内置核心）。
+ * 用于终极兜底：多次重试仍失败时，把所有第三方插件一次性禁用，保住 dsh 能启动。
+ * @param {object} manifest 当前 package.json 解析结果
+ * @returns {string[]}
+ */
+function allThirdPartyBundles(manifest) {
+  const bundles = manifest?.dsh?.profile?.bundles ?? [];
+  return bundles.filter((n) => n && !n.startsWith(INBOX_PREFIX));
+}
+
 // ---------------------------------------------------------------------------
 // 「禁用而不删除」的实现
 // ---------------------------------------------------------------------------
@@ -236,7 +363,8 @@ function disableEntries(profileDirPath, ids) {
  */
 function removeFromBundles(profileDirPath, names) {
   const manifestPath = join(profileDirPath, "package.json");
-  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  const raw = readFileSync(manifestPath, "utf8").replace(/^\uFEFF/, ""); // 容忍 UTF-8 BOM
+  const manifest = JSON.parse(raw);
   const bundles = manifest?.dsh?.profile?.bundles ?? [];
   const next = bundles.filter((n) => !names.includes(n));
   if (next.length === bundles.length) return false;
@@ -316,8 +444,8 @@ function runDsh(profile, dshArgs) {
 
     child.stdout.on("data", (c) => feed(c, process.stdout, "stdout"));
     child.stderr.on("data", (c) => feed(c, process.stderr, "stderr"));
-    child.on("error", (err) => resolvePromise({ error: err, saw }));
-    child.on("exit", (code, signal) => resolvePromise({ code, signal, saw }));
+    child.on("error", (err) => resolvePromise({ error: err, saw, stderr: stderrBuf }));
+    child.on("exit", (code, signal) => resolvePromise({ code, signal, saw, stderr: stderrBuf }));
   });
 }
 
@@ -328,6 +456,7 @@ function runDsh(profile, dshArgs) {
 async function guard(profile, dshArgs, opts) {
   const pDir = profileDir(profile);
   const sDir = snapDir(profile);
+  let exhausted = false; // 是否已做「禁用所有第三方插件」的终极兜底（只做一次）
 
   for (let attempt = 0; ; attempt++) {
     const current = readConfig(pDir);
@@ -360,40 +489,72 @@ async function guard(profile, dshArgs, opts) {
     // 3) 启动失败。
     const bootFailure = saw.fatal || elapsed < opts.graceMs;
 
-    if (bootFailure && good !== null && changed && attempt < opts.retry) {
-      const offenders = computeOffenders(readManifest(current), readManifest(good));
-      if (offenders.length > 0) {
-        // 禁用而不删除：保留已下载的插件，只让它不再参与启动。
-        const unhandled = [];
-        let disabled = 0;
-        for (const name of offenders) {
-          const dir = bundleDir(pDir, name);
-          const ids = dir ? extractEntryIds(dir) : [];
-          if (ids.length > 0) disabled += disableEntries(pDir, ids);
-          else unhandled.push(name);
+    if (bootFailure && good !== null && changed) {
+      // ── 主路径：在指定定位次数内，逐步禁用「候选」插件（错误解析优先） ──
+      if (attempt < opts.retry && !exhausted) {
+        const { combined, fromError } = pickDisableCandidates(
+          readManifest(current),
+          readManifest(good),
+          result.stderr ?? "",
+          profile,
+        );
+
+        if (combined.length > 0) {
+          // 禁用而不删除：保留已下载的插件，只让它不再参与启动。
+          const unhandled = [];
+          let disabled = 0;
+          for (const name of combined) {
+            const dir = bundleDir(pDir, name);
+            const ids = dir ? extractEntryIds(dir) : [];
+            if (ids.length > 0) disabled += disableEntries(pDir, ids);
+            else unhandled.push(name);
+          }
+          if (unhandled.length > 0) removeFromBundles(pDir, unhandled);
+
+          const fromErr =
+            fromError.length > 0
+              ? `（依据启动错误定位：${fromError.join(", ")}）`
+              : "（依据配置变化猜测：无新增/变更，按错误信号禁用）";
+          process.stderr.write(
+            `\n[dsh-dog] ⚠ 启动失败（第 ${attempt + 1} 次）。已禁用（未删除）插件：${combined.join(", ")}；其依赖与下载文件均保留。\n`,
+          );
+          process.stderr.write(`[dsh-dog]    ${fromErr}\n`);
+          process.stderr.write(`[dsh-dog] 第 ${attempt + 2} 次尝试启动 …\n\n`);
+          continue;
         }
-        if (unhandled.length > 0) removeFromBundles(pDir, unhandled);
+
+        // 没有第三方插件变更：多半是用户自己改坏了 cordis.patch.yml 等，回滚这几个文件（不动已下载插件）。
+        restoreFiles(pDir, good, ["cordis.patch.yml", "pnpm-lock.yaml", "pnpm-workspace.yaml"]);
         process.stderr.write(
-          `\n[dsh-dog] ⚠ 启动失败。已禁用（未删除）插件：${offenders.join(", ")}；其依赖与下载文件均保留。\n`,
+          `\n[dsh-dog] ⚠ 启动失败（第 ${attempt + 1} 次），且未发现可定位的插件，已回滚 profile 自身的配置改动（未动已下载插件）。\n`,
         );
         process.stderr.write(`[dsh-dog] 第 ${attempt + 2} 次尝试启动 …\n\n`);
         continue;
       }
 
-      // 没有第三方插件变更：多半是用户自己改坏了 cordis.patch.yml 等，回滚这几个文件（不动已下载插件）。
-      restoreFiles(pDir, good, ["cordis.patch.yml", "pnpm-lock.yaml", "pnpm-workspace.yaml"]);
-      process.stderr.write(
-        `\n[dsh-dog] ⚠ 启动失败，且未发现新增/变更的第三方插件，已回滚 profile 自身的配置改动（未动已下载插件）。\n`,
-      );
-      process.stderr.write(`[dsh-dog] 第 ${attempt + 2} 次尝试启动 …\n\n`);
-      continue;
-    }
-
-    if (bootFailure) {
-      if (good === null || !changed) {
-        process.stderr.write("[dsh-dog] 启动失败，但没有可用的「上次正确配置」（或配置未变化），无法自动处理。\n");
-        process.stderr.write(`[dsh-dog] 请手动修复：${pDir}\n`);
+      // ── 终极兜底：定位次数用尽仍失败 → 禁用所有第三方插件，只留内置核心 ──
+      if (!exhausted) {
+        exhausted = true;
+        const all = allThirdPartyBundles(readManifest(current));
+        if (all.length > 0) {
+          const unhandled = [];
+          let n = 0;
+          for (const name of all) {
+            const dir = bundleDir(pDir, name);
+            const ids = dir ? extractEntryIds(dir) : [];
+            if (ids.length > 0) n += disableEntries(pDir, ids);
+            else unhandled.push(name);
+          }
+          if (unhandled.length > 0) removeFromBundles(pDir, unhandled);
+          process.stderr.write(
+            `\n[dsh-dog] ⚠ 多次重试（${opts.retry} 轮）仍无法启动，已禁用所有第三方插件（${all.length} 个，保留下载、不删除），仅保留内置核心以便 dsh 至少能打开。\n`,
+          );
+          process.stderr.write("[dsh-dog] 最后一次尝试启动 …\n\n");
+          continue;
+        }
+        return code ?? 1;
       }
+
       return code ?? 1;
     }
 
@@ -539,6 +700,16 @@ if (action === "status") {
   process.exit(printStatus(profile));
 }
 
-guard(profile, dshArgs, opts).then((code) => {
-  process.exitCode = code ?? 0;
-});
+export { parsePluginFromStderr, computeOffenders, readConfig, pickDisableCandidates, allThirdPartyBundles };
+
+// 只有作为 CLI 主入口直接运行时才启动看门狗（被 import 做测试时跳过）。
+// Windows 上必须把 argv[1] 规范成与 import.meta.url 一致的绝对路径再比较（/ vs \、大小写）。
+const isMain =
+  Boolean(process.argv[1]) &&
+  fileURLToPath(pathToFileURL(process.argv[1])).toLowerCase() ===
+    fileURLToPath(import.meta.url).toLowerCase();
+if (isMain) {
+  guard(profile, dshArgs, opts).then((code) => {
+    process.exitCode = code ?? 0;
+  });
+}
