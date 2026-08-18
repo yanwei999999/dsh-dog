@@ -266,6 +266,30 @@ function parsePluginFromStderr(stderr, profile = "") {
 }
 
 /**
+ * 判断启动失败是否为「端口被占用」（Node 的 EADDRINUSE）。
+ *
+ * 典型报错（dsh 通过 installFailLoud 打到 stderr）：
+ *   dsh: fatal load failure: Error: listen EADDRINUSE: address already in use 127.0.0.1:3080
+ * 这种失败和任何插件都无关：多半是已有另一个 dsh 实例占着端口。
+ * 看门狗必须识别出来并直接提示用户关闭其他实例，绝不能走进「禁用插件」的逻辑。
+ *
+ * @param {string} stderr dsh 启动收集到的 stderr 全文
+ * @returns {string|null} 命中时返回占用地址描述（如 `127.0.0.1:3080`），否则 null
+ */
+function detectPortBusy(stderr) {
+  if (!stderr) return null;
+  const text = stderr.replace(/\0/g, "");
+  if (!/EADDRINUSE|already in use|端口被占用/i.test(text)) return null;
+  // 优先取 “address already in use <host:port>” 里的地址
+  const m = /address already in use\s+([^\s\n]+)/i.exec(text);
+  if (m) return m[1];
+  // 兜底：在包含 EADDRINUSE 的那一行里找一个 host:port / ip:port 令牌
+  const line = (text.split(/\r?\n/).find((l) => /EADDRINUSE|already in use|端口被占用/i.test(l)) ?? "").trim();
+  const t = /((?:[0-9]{1,3}\.){3}[0-9]{1,3}:\d{1,5}|\[[^\]]+\]:\d{1,5}|[0-9a-fA-F:]+:\d{1,5})/.exec(line);
+  return t ? t[1] : "未知地址";
+}
+
+/**
  * 决策「要禁用哪些插件」的纯函数（便于单测）。
  *
  * 优先级：先从启动错误 stderr 定位真正报错的插件；**只要错误定位到了插件，
@@ -486,6 +510,17 @@ async function guard(profile, dshArgs, opts) {
     // 2) 干净退出但没看到 URL（`dsh web --help`，或启动瞬间 Ctrl+C）：不算失败。
     if (cleanExit) return code ?? 0;
 
+    // 2.5) 端口被占用（EADDRINUSE）：这不是坏插件问题，绝不进入「禁用插件」逻辑。
+    //      多半是已有另一个 dsh 实例占着端口 —— 重试也只会继续撞同一个端口，
+    //      所以直接提示用户关闭其他 dsh 实例并退出，不改动任何配置。
+    const portBusy = detectPortBusy(result.stderr ?? "");
+    if (portBusy !== null) {
+      process.stderr.write(`\n[dsh-dog] ⚠ 端口被占用（${portBusy}）：看起来已经有另一个 dsh 实例在运行。\n`);
+      process.stderr.write("[dsh-dog]   请先关闭其他 dsh 实例/进程（或换一个端口）后再启动。\n");
+      process.stderr.write("[dsh-dog]   本次未禁用、未改动任何插件。\n\n");
+      return code ?? 1;
+    }
+
     // 3) 启动失败。
     const bootFailure = saw.fatal || elapsed < opts.graceMs;
 
@@ -700,7 +735,7 @@ if (action === "status") {
   process.exit(printStatus(profile));
 }
 
-export { parsePluginFromStderr, computeOffenders, readConfig, pickDisableCandidates, allThirdPartyBundles };
+export { parsePluginFromStderr, computeOffenders, readConfig, pickDisableCandidates, allThirdPartyBundles, detectPortBusy };
 
 // 只有作为 CLI 主入口直接运行时才启动看门狗（被 import 做测试时跳过）。
 // Windows 上必须把 argv[1] 规范成与 import.meta.url 一致的绝对路径再比较（/ vs \、大小写）。

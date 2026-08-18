@@ -14,7 +14,7 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { parsePluginFromStderr, pickDisableCandidates, computeOffenders, allThirdPartyBundles } from "../dsh-dog.mjs";
+import { parsePluginFromStderr, pickDisableCandidates, computeOffenders, allThirdPartyBundles, detectPortBusy } from "../dsh-dog.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -113,6 +113,32 @@ const onlyBuiltin = allThirdPartyBundles(
   baseManifest(["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app"]),
 );
 check("只有内置核心时应返回空（无第三方可禁）", onlyBuiltin, []);
+
+// ─────────────────────────────────────────────────────────────
+// 端口被占用（EADDRINUSE）：看门狗必须识别出来，绝不参与插件禁用
+// ─────────────────────────────────────────────────────────────
+
+// 真实形态：installFailLoud 打出的 fatal load failure 里带着 EADDRINUSE
+const SAMPLE_PORT_BUSY = `dsh: fatal load failure: Error: listen EADDRINUSE: address already in use 127.0.0.1:3080
+    at Server.setupListenHandle (node:net:1900:21)
+    at Server.listen (node:net:2042:10)`;
+
+got = detectPortBusy(SAMPLE_PORT_BUSY);
+check("EADDRINUSE 应识别为端口占用并提取地址 127.0.0.1:3080", got, "127.0.0.1:3080");
+
+// 只有 EADDRINUSE 关键字、没有明确地址 → 也识别为端口占用（返回未知地址）
+got = detectPortBusy("Error: listen EADDRINUSE");
+check("只有 EADDRINUSE 关键字也应识别（地址未知）", got, "未知地址");
+
+// 端口占用即使出现在插件报错样本里也不应被误判（EADDRINUSE 是强信号，这里验证普通插件错）
+got = detectPortBusy(SAMPLE_DASH_VAULT);
+check("普通插件报错（Cannot find package）不应判定为端口占用", got, null);
+
+got = detectPortBusy(SAMPLE_EMPTY);
+check("无关错误不应判定为端口占用", got, null);
+
+got = detectPortBusy("");
+check("空 stderr 不应判定为端口占用", got, null);
 
 console.log("\n" + (failures === 0 ? "🎉 全部通过" : `⚠ ${failures} 项未通过`));
 process.exit(failures === 0 ? 0 : 1);

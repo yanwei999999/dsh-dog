@@ -1,6 +1,6 @@
 {
   "name": "dsh-dog",
-  "version": "1.0.0",
+  "version": "1.1.1",
   "description": "Startup watchdog + auto-rollback for DeepSeek Harness (dsh). If `dsh web` fails to boot after installing a plugin, dsh-dog disables the offending plugin (keeps it downloaded) and retries — so a bad plugin never bricks your profile. Installs the `dsh-dog` command and adds it to your PATH.",
   "type": "module",
   "license": "MIT",
