@@ -124,6 +124,38 @@ function global:dsh {
 - 兜底禁用（读不到插件 entry id 时）会把它从 `package.json` 的 `dsh.profile.bundles`
   **移除**（保留依赖与下载）。若保险库/记忆库等突然"消失"，先检查 bundles 列表是否被动过。
 
+## 配套备份插件 dsh-toolbox
+
+[dsh-toolbox](https://github.com/yanwei999999/dsh-toolbox) 是配套的「一键备份」插件：在 dsh 顶栏加一组按钮，
+把**配置、记忆库、保险库、会话、看门狗快照、第三方插件源码**整体打包成带时间戳的备份快照。
+看门狗负责「启动失败自动回滚」，dsh-toolbox 负责「数据日常备份」，两者互补。
+
+### 安装
+
+```bash
+dsh plugin --profile web add dsh-toolbox
+# 或直接从 GitHub 装：
+dsh plugin --profile web add github:yanwei999999/dsh-toolbox
+```
+
+### 首次使用：设置备份路径
+
+1. 重启 `dsh web` 后，顶栏右侧出现「工具箱」按钮组；
+2. 点「完整备份」或「插件备份」，**第一次会弹出引导卡片**要求设置备份路径；
+3. 填入备份目录（如 `D:\backups\dsh` 或 `~/.dsh/backups`，可填移动硬盘/网盘同步目录），点「保存并备份」；
+4. 路径保存在 `~/.dsh/toolbox.config.json`，之后点一下按钮即可一键备份。
+
+插件不写死任何本机路径，任何机器上安装后都能用。
+
+### 备份内容
+
+- **完整备份**：profile 配置 + 记忆库 + 保险库（含 `machine.key`，仅本机可解密）+ 全局设置 + 会话 + 看门狗快照与程序文件 + 第三方插件源码 + 已装插件清单
+- **插件源码备份**：仅第三方插件源码（跳过 `.pnpm` 依赖树与官方核心）
+
+### 恢复
+
+把备份快照里的文件拷回 `~/.dsh` 对应位置，再用 `dsh plugin` 重新安装依赖即可。
+
 ## 与 dsh 的关联
 
 - 兼容 dsh 的 `$DSH_HOME` 约定（默认 `~/.dsh`，可用 `DSH_HOME` 覆盖）。
