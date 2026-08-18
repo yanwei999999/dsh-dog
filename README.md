@@ -127,7 +127,7 @@ function global:dsh {
 ## 配套备份插件 dsh-toolbox
 
 [dsh-toolbox](https://github.com/yanwei999999/dsh-toolbox) 是配套的「一键备份」插件：在 dsh 顶栏加一组按钮，
-把**配置、记忆库、保险库、会话、看门狗快照、第三方插件源码**整体打包成带时间戳的备份快照。
+把**第三方插件源码**整体打包成带时间戳的备份快照。
 看门狗负责「启动失败自动回滚」，dsh-toolbox 负责「数据日常备份」，两者互补。
 
 ### 安装
