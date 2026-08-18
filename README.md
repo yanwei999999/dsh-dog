@@ -154,7 +154,14 @@ dsh plugin --profile web add github:yanwei999999/dsh-toolbox
 
 ### 恢复
 
-把备份快照里的文件拷回 `~/.dsh` 对应位置，再用 `dsh plugin` 重新安装依赖即可。
+> ⚠️ 备份里的 `dsh-plugin-sources/` 是**备份时那台机器**的第三方插件源码（含本地修复版）；
+> 别人的电脑/新机器上不一定有这些插件，恢复前先确认目标机器上装了什么。
+
+- **本机重装后恢复**：把备份拷回 `~/.dsh`，按快照内 `plugins-installed.md` 清单重新安装公开插件
+  （`dsh plugin --profile web add <包名>`）；公开源上找不到的本地修复版插件，才用
+  `dsh-plugin-sources/` 里的源码拷回 `node_modules` 对应位置。
+- **换新电脑 / 给别人用**：只恢复通用数据（profile、storages、sessions、vault、snapshots），
+  插件一律按 `plugins-installed.md` 清单重新安装，不要直接拷贝插件目录。
 
 ## 与 dsh 的关联
 
