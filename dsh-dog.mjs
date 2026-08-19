@@ -12,6 +12,8 @@
  *     （如 `Cannot find package 'dsh-vault' …` → dsh-vault），据此精准禁用;
  *   - 若错误文本解析不到，则回退为「相对上次快照新增/变更的第三方插件」猜测;
  *   - 支持多次重试：一次禁不掉就一直根据下一次错误继续定位（二次、三次…）。
+ *   - 重试用尽仍失败时，只会禁用「错误定位到的真凶」；无法定位则停止并提示，
+ *     绝不连坐无辜插件、绝不全禁所有第三方。
  *   两种手段都只会「禁用」，不会删除已下载的插件。
  *
  * 为什么是外部工具而不是 dsh 插件：坏插件会在插件树加载/启动阶段就让 dsh 崩溃，
@@ -26,7 +28,7 @@
  *   dsh-dog --help
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, statSync, copyFileSync, cpSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { spawn, spawnSync } from "node:child_process";
@@ -65,6 +67,21 @@ const DEFAULT_RETRY = 2;
 /** 内置核心 bundle 前缀：这些是 dsh 安装自带的，永不参与「禁用」。 */
 const INBOX_PREFIX = "@deepseek-ai/";
 
+/**
+ * 硬保护列表：这些插件即使在启动失败/全禁时也**永不参与禁用**。
+ * 独立于白名单文件（白名单被清空/重建也不受影响）。
+ * 默认**为空**（不硬编码任何插件，避免影响其他用户）；
+ * 通过环境变量 `DSH_DOG_KEEP`（逗号分隔）或命令行 `--keep <pkg>` 指定。
+ * 例：DSH_DOG_KEEP=dsh-toolbox,meow-memory dsh-dog web
+ */
+const HARD_KEEP = (process.env.DSH_DOG_KEEP || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+/** 白名单文件（按 profile 分文件，放在 $DSH_HOME/guard-allowlist/<profile>.txt）。 */
+const ALLOWLIST_DIR = "guard-allowlist";
+
 // ---------------------------------------------------------------------------
 // 路径解析（与 DSH 自身 `resolveDshHome` 保持一致）
 // ---------------------------------------------------------------------------
@@ -87,6 +104,69 @@ function profileDir(profile) {
 
 function snapDir(profile) {
   return join(resolveDshHome(), "snapshots", profile);
+}
+
+/** 白名单文件路径：$DSH_HOME/guard-allowlist/<profile>.txt */
+function allowlistPath(profile) {
+  return join(resolveDshHome(), ALLOWLIST_DIR, `${profile}.txt`);
+}
+
+/**
+ * 读取某 profile 的插件白名单（每行一个 bundle 包名，`#` 开头为注释）。
+ * 白名单里的插件即使在启动失败时也不会被看门狗禁用。
+ * @returns Set<string>
+ */
+function readAllowlist(profile) {
+  const p = allowlistPath(profile);
+  const out = new Set();
+  if (!existsSync(p)) return out;
+  try {
+    for (const line of readFileSync(p, "utf8").split(/\r?\n/)) {
+      const t = line.trim();
+      if (!t || t.startsWith("#")) continue;
+      out.add(t);
+    }
+  } catch {
+    /* 读不了就当空白名单。 */
+  }
+  return out;
+}
+
+/** 把某个 bundle 包名加入白名单。返回 true 表示有新增。 */
+function allowPlugin(profile, name) {
+  const p = allowlistPath(profile);
+  const existing = readAllowlist(profile);
+  if (existing.has(name)) return false;
+  mkdirSync(join(resolveDshHome(), ALLOWLIST_DIR), { recursive: true });
+  let content = "";
+  if (existsSync(p)) content = readFileSync(p, "utf8");
+  if (content && !content.endsWith("\n")) content += "\n";
+  content += `${name}\n`;
+  writeFileSync(p, content);
+  return true;
+}
+
+/** 把某个 bundle 包名从白名单移除。返回 true 表示有改动。 */
+function disallowPlugin(profile, name) {
+  const p = allowlistPath(profile);
+  const existing = readAllowlist(profile);
+  if (!existing.has(name)) return false;
+  const kept = [...existing].filter((n) => n !== name);
+  mkdirSync(join(resolveDshHome(), ALLOWLIST_DIR), { recursive: true });
+  writeFileSync(p, kept.length ? kept.join("\n") + "\n" : "");
+  return true;
+}
+
+/**
+ * 过滤掉白名单里的插件（失败时保留、不禁用）。
+ * 硬保护插件（HARD_KEEP：dsh-toolbox / meow-memory）永远保留，
+ * 即使白名单文件被清空/重建也不受影响。
+ */
+function filterAllowlist(profile, names) {
+  const allowlist = readAllowlist(profile);
+  const keep = new Set([...HARD_KEEP, ...allowlist]);
+  if (keep.size === 0) return names;
+  return names.filter((n) => !keep.has(n));
 }
 
 // ---------------------------------------------------------------------------
@@ -144,6 +224,121 @@ function restoreFiles(dir, config, names) {
 
 function restoreSnapshot(dir, config) {
   restoreFiles(dir, config, CONFIG_FILES);
+}
+
+// ---------------------------------------------------------------------------
+// huifu：从备份目录（默认 E:\gongzuo\jiyi）把最新可用备份整体恢复回 ~/.dsh
+// ---------------------------------------------------------------------------
+
+/** 递归把 src 目录内容拷入 dest 目录（创建 dest）。 */
+function copyDirContents(src, dest) {
+  if (!existsSync(src)) return;
+  mkdirSync(dest, { recursive: true });
+  for (const entry of readdirSync(src)) {
+    const s = join(src, entry);
+    const d = join(dest, entry);
+    const st = statSync(s);
+    if (st.isDirectory()) copyDirContents(s, d);
+    else if (st.isFile()) { mkdirSync(dest, { recursive: true }); copyFileSync(s, d); }
+  }
+}
+
+/** 从给定备份目录整体恢复到 DSH_HOME；返回是否成功。 */
+function restoreFromBackup(dir, profile) {
+  const home = resolveDshHome();
+  const pDir = profileDir(profile);
+
+  // 关键校验：备份必须包含 profile 配置，否则视为不可用
+  if (!existsSync(join(dir, "dsh-profile", "package.json"))) return false;
+
+  // 1. profile 配置
+  copyDirContents(join(dir, "dsh-profile"), pDir);
+  // 2. 全局设置（settings.yaml / .anonymous-user-id 等顶层文件）
+  for (const f of readdirSync(dir)) {
+    const p = join(dir, f);
+    if (statSync(p).isFile()) copyFileSync(p, join(home, f));
+  }
+  // 3. dsh-memory / dsh-storages → storages
+  for (const sub of ["dsh-memory", "dsh-storages"]) {
+    copyDirContents(join(dir, sub), join(home, "storages"));
+  }
+  // 4. dsh-vault → vault
+  copyDirContents(join(dir, "dsh-vault"), join(home, "vault"));
+  // 5. watchdog 快照
+  copyDirContents(join(dir, "dsh-watchdog-snapshots", "snapshots"), join(home, "snapshots"));
+  // 6. sessions
+  copyDirContents(join(dir, "dsh-sessions", "sessions"), join(home, "sessions"));
+  // 7. 第三方插件源码 → node_modules（尽力而为，通常可重新安装）
+  copyDirContents(join(dir, "dsh-plugin-sources"), join(pDir, "node_modules"));
+  return true;
+}
+
+/** 列出备份根目录下所有 backup-YYYYMMDD-HHMMSS 目录，按名字倒序（最新在前）。 */
+function listBackups(root) {
+  if (!existsSync(root)) return [];
+  return readdirSync(root)
+    .filter((n) => /^backup-\d{8}-\d{6}$/.test(n))
+    .sort()
+    .reverse();
+}
+
+/** 列出所有 node_modules-backup-YYYYMMDD-HHMMSS 目录。 */
+function listNodeModulesBackups(root) {
+  if (!existsSync(root)) return [];
+  return readdirSync(root).filter((n) => /^node_modules-backup-\d{8}-\d{6}$/.test(n));
+}
+
+/** 把 YYYYMMDD-HHmmss 解析成毫秒时间戳。 */
+function stampToMs(s) {
+  const m = s && s.match(/^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})$/);
+  if (!m) return NaN;
+  return Date.parse(`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}`);
+}
+
+/** 找到与给定 backup-<stamp> 时间最接近的 node_modules-backup-* 目录名；没有返回 null。 */
+function nearestNodeModulesBackup(root, stamp) {
+  const t0 = stampToMs(stamp);
+  if (Number.isNaN(t0)) return null;
+  let best = null;
+  let bestDiff = Infinity;
+  for (const n of listNodeModulesBackups(root)) {
+    const m = n.match(/^node_modules-backup-(\d{8})-(\d{6})$/);
+    if (!m) continue;
+    const t = stampToMs(`${m[1]}-${m[2]}`);
+    const diff = Math.abs(t - t0);
+    if (diff < bestDiff) { bestDiff = diff; best = n; }
+  }
+  return best;
+}
+
+function runHuifu(profile, backupDir) {
+  const backups = listBackups(backupDir);
+  if (backups.length === 0) {
+    process.stderr.write(`[dsh-dog] 备份目录里没有可用备份：${backupDir}\n`);
+    return 1;
+  }
+  for (const name of backups) {
+    const dir = join(backupDir, name);
+    process.stdout.write(`[dsh-dog] 尝试恢复：${name} …\n`);
+    const ok = restoreFromBackup(dir, profile);
+    if (ok) {
+      // 同步配套的 node_modules-backup-*（按时间最接近配对），拷回 node_modules
+      const stamp = name.replace(/^backup-/, "");
+      const nmBackup = nearestNodeModulesBackup(backupDir, stamp);
+      if (nmBackup) {
+        copyDirContents(join(backupDir, nmBackup), join(profileDir(profile), "node_modules"));
+        process.stdout.write(`[dsh-dog] ✔ 已同步 node_modules-backup（${nmBackup}）到 node_modules\n`);
+      } else {
+        process.stdout.write("[dsh-dog] （未找到配套的 node_modules-backup-*，跳过 node_modules 同步）\n");
+      }
+      process.stdout.write(`[dsh-dog] ✔ 已从 ${name} 恢复到 ${resolveDshHome()}\n`);
+      process.stdout.write(`[dsh-dog] 提示：重启 dsh 前如依赖有变，可运行 pnpm install（dsh web 重启会自动对齐）。\n`);
+      return 0;
+    }
+    process.stdout.write(`[dsh-dog] ${name} 缺少关键配置（dsh-profile/package.json），跳过，尝试更早备份…\n`);
+  }
+  process.stderr.write("[dsh-dog] 所有备份均不可用，恢复失败。\n");
+  return 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -314,13 +509,37 @@ function pickDisableCandidates(currentManifest, goodManifest, stderr, profile = 
 
 /**
  * 收集 profile 里「所有第三方」bundle 名（排除 @deepseek-ai/* 内置核心）。
- * 用于终极兜底：多次重试仍失败时，把所有第三方插件一次性禁用，保住 dsh 能启动。
+ * 仅供查询/测试/手动 nuke 命令使用；自动兜底不会全禁第三方。
  * @param {object} manifest 当前 package.json 解析结果
  * @returns {string[]}
  */
 function allThirdPartyBundles(manifest) {
   const bundles = manifest?.dsh?.profile?.bundles ?? [];
   return bundles.filter((n) => n && !n.startsWith(INBOX_PREFIX));
+}
+
+/**
+ * 手动「全禁」：禁用 profile 里所有第三方插件（保留下载、不删除），只留内置核心。
+ * 仅由用户显式执行 `dsh-dog nuke <profile>` 触发，自动看门狗绝不调用。
+ * 默认保留 dsh-toolbox 不禁用（用户要求：工具箱始终可用）。
+ * @param {string} profileDirPath profile 目录
+ * @param {object} manifest 当前 package.json 解析结果
+ * @param {string[]} [keep] 额外保留的插件名（不禁用）
+ * @returns {number} 实际处理（禁用/移除）的插件数
+ */
+function nukeAllThirdParty(profileDirPath, manifest, keep = []) {
+  const keepSet = new Set([...HARD_KEEP, ...keep]); // 硬保护：dsh-toolbox / meow-memory 永不全禁
+  const all = allThirdPartyBundles(manifest).filter((n) => !keepSet.has(n));
+  const unhandled = [];
+  let n = 0;
+  for (const name of all) {
+    const dir = bundleDir(profileDirPath, name);
+    const ids = dir ? extractEntryIds(dir) : [];
+    if (ids.length > 0) n += disableEntries(profileDirPath, ids);
+    else unhandled.push(name);
+  }
+  if (unhandled.length > 0) removeFromBundles(profileDirPath, unhandled);
+  return all.length;
 }
 
 // ---------------------------------------------------------------------------
@@ -533,12 +752,14 @@ async function guard(profile, dshArgs, opts) {
           result.stderr ?? "",
           profile,
         );
+        // 白名单里的插件保留启用；只禁用不在白名单里的。
+        const candidates = filterAllowlist(profile, combined);
 
-        if (combined.length > 0) {
+        if (candidates.length > 0) {
           // 禁用而不删除：保留已下载的插件，只让它不再参与启动。
           const unhandled = [];
           let disabled = 0;
-          for (const name of combined) {
+          for (const name of candidates) {
             const dir = bundleDir(pDir, name);
             const ids = dir ? extractEntryIds(dir) : [];
             if (ids.length > 0) disabled += disableEntries(pDir, ids);
@@ -550,10 +771,21 @@ async function guard(profile, dshArgs, opts) {
             fromError.length > 0
               ? `（依据启动错误定位：${fromError.join(", ")}）`
               : "（依据配置变化猜测：无新增/变更，按错误信号禁用）";
+          const skippedAllowlist = combined.length - candidates.length;
+          const skipNote = skippedAllowlist > 0 ? `；白名单保留 ${skippedAllowlist} 个不禁用` : "";
           process.stderr.write(
-            `\n[dsh-dog] ⚠ 启动失败（第 ${attempt + 1} 次）。已禁用（未删除）插件：${combined.join(", ")}；其依赖与下载文件均保留。\n`,
+            `\n[dsh-dog] ⚠ 启动失败（第 ${attempt + 1} 次）。已禁用（未删除）插件：${candidates.join(", ")}${skipNote}；其依赖与下载文件均保留。\n`,
           );
           process.stderr.write(`[dsh-dog]    ${fromErr}\n`);
+          process.stderr.write(`[dsh-dog] 第 ${attempt + 2} 次尝试启动 …\n\n`);
+          continue;
+        }
+
+        if (combined.length > 0) {
+          // 候选插件全在白名单里：保留，不做禁用，重试。
+          process.stderr.write(
+            `\n[dsh-dog] ℹ 启动失败（第 ${attempt + 1} 次），但候选插件均在白名单中，已全部保留、不禁用。\n`,
+          );
           process.stderr.write(`[dsh-dog] 第 ${attempt + 2} 次尝试启动 …\n\n`);
           continue;
         }
@@ -567,14 +799,21 @@ async function guard(profile, dshArgs, opts) {
         continue;
       }
 
-      // ── 终极兜底：定位次数用尽仍失败 → 禁用所有第三方插件，只留内置核心 ──
+      // ── 终极兜底：定位次数用尽仍失败 → 只禁「错误定位到的真凶」，绝不连坐/全禁 ──
       if (!exhausted) {
         exhausted = true;
-        const all = allThirdPartyBundles(readManifest(current));
-        if (all.length > 0) {
+        // 仍从最后一次启动错误里解析真凶：只禁报错者，不连坐无辜插件、不全禁第三方。
+        const { fromError } = pickDisableCandidates(
+          readManifest(current),
+          readManifest(good),
+          result.stderr ?? "",
+          profile,
+        );
+        const candidates = filterAllowlist(profile, fromError);
+        if (candidates.length > 0) {
           const unhandled = [];
           let n = 0;
-          for (const name of all) {
+          for (const name of candidates) {
             const dir = bundleDir(pDir, name);
             const ids = dir ? extractEntryIds(dir) : [];
             if (ids.length > 0) n += disableEntries(pDir, ids);
@@ -582,11 +821,16 @@ async function guard(profile, dshArgs, opts) {
           }
           if (unhandled.length > 0) removeFromBundles(pDir, unhandled);
           process.stderr.write(
-            `\n[dsh-dog] ⚠ 多次重试（${opts.retry} 轮）仍无法启动，已禁用所有第三方插件（${all.length} 个，保留下载、不删除），仅保留内置核心以便 dsh 至少能打开。\n`,
+            `\n[dsh-dog] ⚠ 多次重试（${opts.retry} 轮）仍无法启动，仅禁用错误定位到的插件：${candidates.join(", ")}（保留下载、不删除）。\n`,
           );
           process.stderr.write("[dsh-dog] 最后一次尝试启动 …\n\n");
           continue;
         }
+        // 解析不到任何真凶：不再全禁第三方，停止并提示用户手动排查（避免误杀无辜插件）。
+        process.stderr.write(
+          `\n[dsh-dog] ⚠ 多次重试（${opts.retry} 轮）仍无法启动，且无法从启动错误中定位到具体插件。\n`,
+        );
+        process.stderr.write("[dsh-dog] 为避免误杀，本次未禁用、未改动任何插件。请手动查看启动日志排查根因。\n");
         return code ?? 1;
       }
 
@@ -635,6 +879,14 @@ function printStatus(profile) {
     for (const name of offenders) process.stdout.write(`  - ${name}\n`);
   }
 
+  const allowlist = readAllowlist(profile);
+  process.stdout.write("\n白名单（启动失败时保留启用、不禁用的插件）：\n");
+  if (allowlist.size === 0) {
+    process.stdout.write("  （空）\n");
+  } else {
+    for (const name of [...allowlist].sort()) process.stdout.write(`  - ${name}\n`);
+  }
+
   process.stdout.write("\n");
   if (diffCount === 0) process.stdout.write("当前配置与快照一致。\n");
   else process.stdout.write(`有 ${diffCount} 个文件与快照不同。自动看门狗会优先「禁用」坏插件（不删除）；如需硬回滚请用 restore。\n`);
@@ -648,7 +900,12 @@ function printHelp() {
   dsh-dog [守卫参数] <profile> [传给 dsh 的参数…]
   dsh-dog snapshot <profile>      把当前配置标记为「已知可用」（不启动）
   dsh-dog restore <profile>       硬回滚到快照（会移除快照后新增的插件；请谨慎）
-  dsh-dog status <profile>        显示当前配置与快照差异、将被禁用的插件
+  dsh-dog status <profile>        显示当前配置与快照差异、将被禁用的插件、白名单
+  dsh-dog allowlist <profile>     查看插件白名单（启动失败时保留、不禁用）
+  dsh-dog allow <profile> <pkg>   把插件加入白名单（失败时保留启用）
+  dsh-dog disallow <profile> <pkg> 把插件移出白名单
+  dsh-dog nuke <profile>          手动禁用全部第三方插件（保留 dsh-toolbox；仅显式触发，自动看门狗不会全禁）
+  dsh-dog huifu [<profile>]       从备份目录按「最新→次新」恢复全部文件到 ~/.dsh（含配套 node_modules-backup；需用 --backup-dir 指定备份目录）
   dsh-dog --help
 
 守卫参数（必须放在 <profile> 前面）：
@@ -656,11 +913,13 @@ function printHelp() {
   --retry <次数>       失败处理后自动重试次数，默认 ${DEFAULT_RETRY}
   --no-install         硬回滚后不跑 pnpm install
   --profile <名字>     显式指定 profile（等价于位置参数）
+  --backup-dir <路径>  huifu 的备份目录（必须指定，如 D:\\backup\\dsh）
 
 示例：
   dsh-dog web
   dsh-dog web --host 127.0.0.1
   dsh-dog snapshot web
+  dsh-dog allow web dsh-toolbox    # 失败时保留 dsh-toolbox 不禁用
 `);
 }
 
@@ -669,7 +928,7 @@ function printHelp() {
 // ---------------------------------------------------------------------------
 
 function parseArgs(argv) {
-  const opts = { graceMs: DEFAULT_GRACE_MS, retry: DEFAULT_RETRY, noInstall: false };
+  const opts = { graceMs: DEFAULT_GRACE_MS, retry: DEFAULT_RETRY, noInstall: false, backupDir: "", keep: undefined };
   let profile = null;
   let action = null;
   let i = 0;
@@ -685,14 +944,19 @@ function parseArgs(argv) {
     if (a === "--retry") { opts.retry = num(argv[++i], DEFAULT_RETRY); continue; }
     if (a === "--profile") { profile = argv[++i]; continue; }
     if (a === "--no-install") { opts.noInstall = true; continue; }
+    if (a === "--backup-dir") { opts.backupDir = argv[++i]; continue; }
+    if (a === "--keep") { opts.keep = argv[++i]; continue; }
     if (a === "--help" || a === "-h") { printHelp(); return null; }
     break;
   }
 
   const first = argv[i];
 
-  if (first === "snapshot" || first === "restore" || first === "rollback" || first === "status") {
+  if (first === "snapshot" || first === "restore" || first === "rollback" || first === "status" || first === "huifu" || first === "nuke") {
     action = first === "rollback" ? "restore" : first;
+    profile = profile ?? argv[i + 1] ?? "web";
+  } else if (first === "allowlist" || first === "allow" || first === "disallow") {
+    action = first;
     profile = profile ?? argv[i + 1] ?? "web";
   } else {
     profile = profile ?? first ?? "web";
@@ -735,7 +999,61 @@ if (action === "status") {
   process.exit(printStatus(profile));
 }
 
-export { parsePluginFromStderr, computeOffenders, readConfig, pickDisableCandidates, allThirdPartyBundles, detectPortBusy };
+if (action === "huifu") {
+  if (!opts.backupDir) {
+    process.stderr.write("[dsh-dog] 请用 --backup-dir <路径> 指定备份目录（如 D:\\backup\\dsh）。\n");
+    process.exit(1);
+  }
+  process.exit(runHuifu(profile, opts.backupDir));
+}
+
+// nuke：手动「禁用所有第三方插件」（仅用户显式触发；自动看门狗不会全禁）
+if (action === "nuke") {
+  const pDir = profileDir(profile);
+  const manifest = readManifest(readConfig(pDir));
+  const keepList = opts.keep ? String(opts.keep).split(",").map((s) => s.trim()).filter(Boolean) : [];
+  const count = nukeAllThirdParty(pDir, manifest, keepList);
+  const keepNames = [...HARD_KEEP, ...keepList];
+  process.stdout.write(
+    `[dsh-dog] ✔ 已手动禁用第三方插件（${count} 个，保留下载、不删除），仅保留内置核心与硬保护插件（${keepNames.length ? keepNames.join(" / ") : "无"}）。\n`,
+  );
+  process.stdout.write("[dsh-dog] 提示：如需恢复，请用 `dsh-dog restore <profile>` 回滚到上次可用快照。\n");
+  process.exit(0);
+}
+
+// allow / disallow / allowlist：管理白名单（放前面处理，不触发 guard）
+if (action === "allowlist") {
+  const list = readAllowlist(profile);
+  process.stdout.write(`[dsh-dog] ${profile} 的白名单（启动失败时保留、不禁用）：\n`);
+  if (list.size === 0) process.stdout.write("  （空）\n");
+  else for (const name of [...list].sort()) process.stdout.write(`  - ${name}\n`);
+  process.stdout.write(`\n白名单文件：${allowlistPath(profile)}\n`);
+  process.exit(0);
+}
+
+// `allow web pkg` / `disallow web pkg`：从原始 argv 里取 pkg
+const rawIdx = process.argv.indexOf(action);
+const raw = process.argv.slice(rawIdx + 1); // [profile, pkg...]
+const targetProfile = raw[0] || profile;
+const pkgs = raw.slice(1).filter((p) => p && !p.startsWith("--"));
+if (action === "allow" || action === "disallow") {
+  if (pkgs.length === 0) {
+    process.stderr.write(`[dsh-dog] 用法：dsh-dog ${action} <profile> <bundle包名…>\n`);
+    process.exit(1);
+  }
+  let changed = 0;
+  for (const pkg of pkgs) {
+    const ok = action === "allow" ? allowPlugin(targetProfile, pkg) : disallowPlugin(targetProfile, pkg);
+    if (ok) changed += 1;
+    process.stdout.write(
+      `[dsh-dog] ${action === "allow" ? "已加入" : "已移出"}白名单：${pkg}${ok ? "" : "（无变化）"}\n`,
+    );
+  }
+  process.stdout.write(`[dsh-dog] ✔ ${changed} 项变更。白名单文件：${allowlistPath(targetProfile)}\n`);
+  process.exit(0);
+}
+
+export { parsePluginFromStderr, computeOffenders, readConfig, pickDisableCandidates, allThirdPartyBundles, nukeAllThirdParty, detectPortBusy, listBackups, restoreFromBackup, runHuifu, listNodeModulesBackups, nearestNodeModulesBackup, readAllowlist, allowPlugin, disallowPlugin };
 
 // 只有作为 CLI 主入口直接运行时才启动看门狗（被 import 做测试时跳过）。
 // Windows 上必须把 argv[1] 规范成与 import.meta.url 一致的绝对路径再比较（/ vs \、大小写）。

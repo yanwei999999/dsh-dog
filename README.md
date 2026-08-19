@@ -124,6 +124,24 @@ function global:dsh {
 - 兜底禁用（读不到插件 entry id 时）会把它从 `package.json` 的 `dsh.profile.bundles`
   **移除**（保留依赖与下载）。若保险库/记忆库等突然"消失"，先检查 bundles 列表是否被动过。
 
+## 硬保护插件（可选配置）
+
+默认看门狗**不硬编码任何插件**，避免影响不同机器/用户的配置。若你希望某些插件
+**永不参与禁用/全禁**（即使白名单被清空、跑 `dsh-dog nuke` 也不受影响），用以下任一方式：
+
+- **环境变量**（推荐，可写进 shell 配置）：
+  ```bash
+  export DSH_DOG_KEEP="dsh-toolbox,meow-memory"
+  dsh web          # 启动看门狗时自动生效
+  dsh-dog nuke web # nuke 时同样保留
+  ```
+- **命令行参数**（仅对本次 nuke 生效）：
+  ```bash
+  dsh-dog nuke web --keep dsh-toolbox,meow-memory
+  ```
+
+- `dsh-dog huifu` 的备份目录默认不指定，需显式传 `--backup-dir <路径>`。
+
 ## 配套备份插件 dsh-toolbox
 
 [dsh-toolbox](https://github.com/yanwei999999/dsh-toolbox) 是配套的「一键备份」插件：在 dsh 顶栏加一组按钮，

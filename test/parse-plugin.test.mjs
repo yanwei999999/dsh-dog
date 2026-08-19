@@ -11,7 +11,7 @@
  * 用法：node test/parse-plugin.test.mjs
  */
 
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parsePluginFromStderr, pickDisableCandidates, computeOffenders, allThirdPartyBundles, detectPortBusy } from "../dsh-dog.mjs";
@@ -139,6 +139,98 @@ check("无关错误不应判定为端口占用", got, null);
 
 got = detectPortBusy("");
 check("空 stderr 不应判定为端口占用", got, null);
+
+// ─────────────────────────────────────────────────────────────
+// nuke（手动全禁）：nukeAllThirdParty 应禁用所有第三方、保留内置
+// ─────────────────────────────────────────────────────────────
+import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { nukeAllThirdParty } from "../dsh-dog.mjs";
+
+{
+  const dir = mkdtempSync(join(tmpdir(), "dsh-dog-nuke-"));
+  const nm = join(dir, "node_modules");
+  mkdirSync(nm, { recursive: true });
+  // 真实 package.json（3 个第三方 + dsh-toolbox）
+  const pkgPath = join(dir, "package.json");
+  writeFileSync(
+    pkgPath,
+    JSON.stringify(
+      { name: "web", private: true, dependencies: {}, dsh: { profile: { bundles: ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "p1", "p2", "p3", "dsh-toolbox", "meow-memory"] } } },
+      null,
+      2,
+    ),
+  );
+  // p1/p2 有 cordis.patch.yml（能提取 entry id）；p3 无 node_modules（走 removeFromBundles）
+  for (const p of ["p1", "p2"]) {
+    const pkgDir = join(nm, p);
+    mkdirSync(pkgDir, { recursive: true });
+    writeFileSync(
+      join(pkgDir, "package.json"),
+      JSON.stringify({ name: p, dsh: { bundle: { patch: "./cordis.patch.yml" } } }),
+    );
+    writeFileSync(join(pkgDir, "cordis.patch.yml"), `- insert:\n    - id: ${p}\n      name: ${p}\n`);
+  }
+  // dsh-toolbox 目录存在（有 patch，能提取 entry id）—— 验证它被保留
+  {
+    const pkgDir = join(nm, "dsh-toolbox");
+    mkdirSync(pkgDir, { recursive: true });
+    writeFileSync(
+      join(pkgDir, "package.json"),
+      JSON.stringify({ name: "dsh-toolbox", dsh: { bundle: { patch: "./cordis.patch.yml" } } }),
+    );
+    writeFileSync(join(pkgDir, "cordis.patch.yml"), `- insert:\n    - id: dsh-toolbox\n      name: dsh-toolbox\n`);
+  }
+  // meow-memory 目录存在 —— 硬保护：nuke 时也保留
+  {
+    const pkgDir = join(nm, "meow-memory");
+    mkdirSync(pkgDir, { recursive: true });
+    writeFileSync(
+      join(pkgDir, "package.json"),
+      JSON.stringify({ name: "meow-memory", dsh: { bundle: { patch: "./cordis.patch.yml" } } }),
+    );
+    writeFileSync(join(pkgDir, "cordis.patch.yml"), `- insert:\n    - id: meow-memory\n      name: meow-memory\n`);
+  }
+  const manifest = JSON.parse(readFileSync(pkgPath, "utf8"));
+  const count = nukeAllThirdParty(dir, manifest, ["dsh-toolbox", "meow-memory"]); // 模拟本机 DSH_DOG_KEEP
+  check("nuke 应处理 3 个第三方（keep 指定插件保留）", count, 3);
+  // p1/p2 → 追加 disabled 到 profile 的 cordis.patch.yml
+  const patchPath = join(dir, "cordis.patch.yml");
+  const patchTxt = existsSync(patchPath) ? readFileSync(patchPath, "utf8") : "";
+  check("p1 被追加禁用", patchTxt.includes("id: p1") && patchTxt.includes("disabled: true"), true);
+  check("p2 被追加禁用", patchTxt.includes("id: p2") && patchTxt.includes("disabled: true"), true);
+  check("内置核心不受影响", !patchTxt.includes("dsh-base"), true);
+  check("dsh-toolbox 不被禁用（硬保护）", !patchTxt.includes("id: dsh-toolbox") || !patchTxt.includes("disabled: true"), true);
+  check("meow-memory 不被禁用（硬保护）", !patchTxt.includes("id: meow-memory") || !patchTxt.includes("disabled: true"), true);
+  // p3 → 从 bundles 移除
+  const after = JSON.parse(readFileSync(pkgPath, "utf8"));
+  check("p3 从 bundles 移除", !after.dsh.profile.bundles.includes("p3"), true);
+  check("dsh-toolbox 仍在 bundles（硬保护）", after.dsh.profile.bundles.includes("dsh-toolbox"), true);
+  check("meow-memory 仍在 bundles（硬保护）", after.dsh.profile.bundles.includes("meow-memory"), true);
+  check("内置核心仍在 bundles", after.dsh.profile.bundles.includes("@deepseek-ai/dsh-base"), true);
+}
+
+// 默认 HARD_KEEP 为空：不带 keep 时 nuke 应处理全部第三方（不硬编码任何插件，不影响其他用户）
+{
+  const dir = mkdtempSync(join(tmpdir(), "dsh-dog-nuke-empty-"));
+  const nm = join(dir, "node_modules");
+  mkdirSync(nm, { recursive: true });
+  const pkgPath = join(dir, "package.json");
+  writeFileSync(
+    pkgPath,
+    JSON.stringify(
+      { name: "web", private: true, dependencies: {}, dsh: { profile: { bundles: ["@deepseek-ai/dsh-base", "p1", "p2"] } } },
+      null,
+      2,
+    ),
+  );
+  const manifest = JSON.parse(readFileSync(pkgPath, "utf8"));
+  const count = nukeAllThirdParty(dir, manifest); // 不传 keep → HARD_KEEP 默认空
+  check("默认无硬保护时 nuke 处理全部第三方（2 个）", count, 2);
+  const after = JSON.parse(readFileSync(pkgPath, "utf8"));
+  check("p1 被移除", !after.dsh.profile.bundles.includes("p1"), true);
+  check("p2 被移除", !after.dsh.profile.bundles.includes("p2"), true);
+}
 
 console.log("\n" + (failures === 0 ? "🎉 全部通过" : `⚠ ${failures} 项未通过`));
 process.exit(failures === 0 ? 0 : 1);
